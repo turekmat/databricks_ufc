@@ -44,6 +44,26 @@ PATH_LOGS_RUN     = abfss("logs",   "ufc/pipeline")
 PATH_LANDING_ROOT = abfss("landing","espn/ufc/events")
 PATH_RAW_ROOT     = abfss("raw",    "espn/ufc/events")
 
+# ===== BACKFILL CLEANUP (nuke-and-pave for conflicting data) =====
+if run_mode == "backfill":
+    print("Backfill mode detected → wiping bronze events/fights and watermark to start fresh")
+    # Ensure database exists, then drop tables if present
+    try:
+        spark.sql(f"CREATE DATABASE IF NOT EXISTS hive_metastore.{DB_NAME}")
+    except Exception:
+        pass
+    for tbl in ["espn_events", "espn_fights", "ufc_last_event_date"]:
+        try:
+            spark.sql(f"DROP TABLE IF EXISTS hive_metastore.{DB_NAME}.{tbl}")
+        except Exception:
+            pass
+    # Remove underlying locations (Delta paths and watermark path)
+    for p in [PATH_EVENTS_DELTA, PATH_FIGHTS_DELTA, PATH_META_WM]:
+        try:
+            dbutils.fs.rm(p, recurse=True)
+        except Exception:
+            pass
+
 # ===== RUNTIME & BOOTSTRAP (bez vytváření Delta LOCATION složek) =====
 from datetime import datetime, timezone, date, timedelta
 import json, time, math
@@ -136,10 +156,21 @@ def write_landing(day, scoreboard_json, event_payloads):
     base = f"{PATH_LANDING_ROOT}/run_id={RUN_ID}"
     dstr = day.strftime('%Y%m%d')
     put_json(f"{base}/scoreboard_{dstr}.json", scoreboard_json)
-    print(f"scoreboard {dstr} done")
     for eid, ev in event_payloads.items():
         put_json(f"{base}/event_{eid}.json", ev)
-        print(f"event {eid} done")
+        # print only event date DONE
+        try:
+            node = ev.get("header") if isinstance(ev, dict) and isinstance(ev.get("header"), dict) else ev
+            ev_dt = (node.get("date") if isinstance(node, dict) else None) or (
+                node.get("competitions", [{}])[0].get("date") if isinstance(node, dict) else None
+            )
+            if isinstance(ev_dt, str) and len(ev_dt) >= 10:
+                ev_str = ev_dt[:10]
+            else:
+                ev_str = dstr
+        except Exception:
+            ev_str = dstr
+        print(f"event {ev_str} done")
 
 def mirror_to_raw():
     src = f"{PATH_LANDING_ROOT}/run_id={RUN_ID}"
@@ -485,8 +516,24 @@ try:
 
     mirror_to_raw()
     df_e, df_f = rows_to_df(event_rows_all, fight_rows_all)
-    run_stats["events"] = df_e.count(); run_stats["fights"] = df_f.count()
-    upsert_bronze(df_e, df_f)
+    # Guard against default partition: drop records with null event_date/event_year
+    df_e_valid = df_e.filter((F.col("event_date").isNotNull()) & (F.col("event_year").isNotNull()))
+    df_f_valid = df_f.filter((F.col("event_date").isNotNull()) & (F.col("event_year").isNotNull()))
+    dropped_e = df_e.count() - df_e_valid.count()
+    dropped_f = df_f.count() - df_f_valid.count()
+    if dropped_e or dropped_f:
+        put_json(f"{PATH_LOGS_RUN}/run_id={RUN_ID}/dropped_null_partitions.json", {
+            "dropped_events": int(dropped_e),
+            "dropped_fights": int(dropped_f)
+        })
+    run_stats["events"] = df_e_valid.count(); run_stats["fights"] = df_f_valid.count()
+    upsert_bronze(df_e_valid, df_f_valid)
+    # Refresh table metadata to avoid stale reads
+    try:
+        spark.catalog.refreshTable(f"hive_metastore.{DB_NAME}.espn_events")
+        spark.catalog.refreshTable(f"hive_metastore.{DB_NAME}.espn_fights")
+    except Exception:
+        pass
 
     if run_stats["events"]>0:
         max_dt = df_e.agg(F.max("event_date")).first()[0]
