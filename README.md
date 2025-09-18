@@ -1,33 +1,30 @@
-## Databricks UFC Pipeline (ESPN → ADLS → Delta)
+## UFC Data Platform on Databricks (ESPN → ADLS → Delta)
 
-### Overview
+This project is a compact, production‑minded data platform built on Databricks (free tier). It ingests public UFC data from ESPN, cleans it to reliable Delta tables, and materializes analytics that answer real fight questions.
 
-Automated pipeline to ingest UFC data from the unofficial ESPN Core/Scoreboard APIs into Azure Data Lake Storage (ADLS) and Delta tables on Databricks.
+### What I built
 
-- **Ingest**: events, fights, and athletes (profiles)
-- **Storage layers**: landing → raw → bronze (Delta) → silver (Delta)
-- **Goals**: incremental loads with watermark, backfill, idempotent MERGE-based upserts, data quality in silver
+- End‑to‑end lakehouse: landing → raw → bronze (Delta) → silver (clean) → gold (marts)
+- Incremental, idempotent ingestion with watermark + overlap (late data safe)
+- Robustness on free tier: self‑healing silver when bronze Delta logs are corrupted; backfill‑only reset
+- Secure access (Databricks Secrets), UC‑friendly databases, parameterized notebooks
+- Analytics with clear storytelling (stance/style matchups, team performance, height/reach advantage)
 
-### Key notebooks/scripts
+### How it works
 
-- `01_ingest_espn_fights.py`: Ingest events and fights to bronze (Delta) + raw JSON mirror
-- `02_explore_espn_bronze.ipynb`: Quick summaries and validations of bronze
-- `02_ingest_espn_athletes.ipynb`: Ingest athlete profiles to bronze (Delta) + raw JSON mirror
-- `11_events_clean.ipynb`: Clean `espn_events` → `espn_events_silver`
-- `12_fights_clean.ipynb`: Clean `espn_fights` → `espn_fights_silver`
-- `13_athletes_clean.ipynb`: Clean `espn_athletes` → `espn_athletes_silver`
+- Ingest pulls ESPN Core v2 JSON, saves to landing and mirrors to raw, then MERGEs to bronze (events, fights, athletes).
+- Silver standardizes schema, trims/cleans text, deduplicates by natural keys, and prunes sparse columns. If bronze is unreadable, it automatically falls back to RAW to keep the pipeline green.
+- Gold rebuilds small, focused Delta marts on each run (overwrite) for deterministic BI.
 
-### Minimal run order
+### Reliability details
 
-1. `01_ingest_espn_fights.py`
-2. `02_ingest_espn_athletes.ipynb`
-3. `11_events_clean.ipynb`, `12_fights_clean.ipynb`, `13_athletes_clean.ipynb`
-4. (Optional) `02_explore_espn_bronze.ipynb` to validate bronze
+- MERGE keys: events `event_id`; fights `event_id+competition_id`; athletes `athlete_id`.
+- Watermark table controls incremental window; first run backfills, next runs pick up just changes.
+- Task‑to‑task passing: the fights task passes new `athlete_id` values to the next step (fewer API calls, still idempotent).
 
-### Storage & catalog
+### Examples of insights
 
-- ADLS containers expected: `landing`, `raw`, `bronze` (and `silver` if desired)
-- Unity Catalog: uses `hive_metastore` with configurable DBs (default `ufc_bronze`, `ufc_silver`)
-- Access: set account key via Databricks secrets in the bootstrap widgets/cells
-
-This README is intentionally brief; expand with setup steps, widgets, and examples as the project stabilizes.
+- Which stance beats which across the sport? (stance matchup matrix)
+- Do certain “styles” (Striker/Wrestler/MMA/Street) dominate specific matchups?
+- Which teams have the highest win rate and how many fights per fighter do they produce?
+- How much does height/reach advantage help? (binned win‑rate vs height/reach advantage)
